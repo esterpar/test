@@ -22,6 +22,7 @@ using InstrumentsLib.Tools.Instruments.ESA;
 using InstrumentsLib.Tools.Instruments.O2E;
 using System.Collections;
 using System.Drawing;
+using System.Threading;
 
 namespace AutoSPANMeasLib
 {
@@ -121,7 +122,8 @@ namespace AutoSPANMeasLib
             {"EITM", AlignmentTypes.SMTx}, // POR for TX systems. MM on EITM. Verify if also good for MM on VIT
             {"VIT" , AlignmentTypes.TxOpticalFBT}, // Matlab POR, uses optical tracking. SM on VIT. MM disables tracking
             //{"EIT" , AlignmentTypes.SMTxLowNA} // POR PIAlignSys for edge coupler
-            {"EIT" , AlignmentTypes.TRX_SINGLE_CH} // POR PIAlignSys for edge coupler
+            {"EIT" , AlignmentTypes.TRX_SINGLE_CH}, // POR PIAlignSys for edge coupler
+            {"SMTx" , AlignmentTypes.SMTx} // 6/24 ester added for WLT-1242. use SMTx, GC or OO???
         };
         private AlignmentTypes _alignmentType;
         private string _COUPLER; // Optical coupler, EITM,VIT
@@ -143,13 +145,23 @@ namespace AutoSPANMeasLib
         private List<string> _arPins_SMU5;
         //private List<string> _arPins_SMU6;
 
+        /* 6/24 edit
+        * cntrl+f, keyword match pattern for "override" and "virtual"
+        * AutoSPANMeasLibrary inherits to customize functionality of its unique implementation
+        * ^customization happens mainly in overriding of its abstract base class
+        * we will modify these members and attributes to handle
+        * 1) grating coupler output instead of VIT out
+        * 2) SMU and matrix pipeline
+        * 3) spectral-LI sweeps, while being biased, and measuring RIN, SMSR, 
+        * 4) hong wants this using best practices
+        */
         public override bool pretest()
         {
             // Validate inputs first.  Use TryParse to read in decimal and exponential format, error on fail to parse
             Debug.Print("Laser_to_VIT_Structure_EO_RIN_SMSR.pretest()");
             base.pretest();
 
-            _loss = new InsertionLossObj();
+            //_loss = new InsertionLossObj(); // 6/24 ester we dont need insertion loss 
             InitializeDataTables();
             ParseInputs();
             ParseTerminals();
@@ -288,7 +300,8 @@ namespace AutoSPANMeasLib
             GetParseInputValue("ESA_POINTS", out _ESA_POINTS, x=> x >= -1, -1);
             GetParseInputValue("ESA_STOP_FREQ", out _ESA_STOP_FREQ, null, 10e9); 
             GetParseInputValue("PD_TIA_RF_GAIN", out _PD_TIA_RF_GAIN, null, 46.5);
-            GetParseInputValue("COUPLER", out _COUPLER, x => _coupler_types.ContainsKey(x), "VIT");
+            //GetParseInputValue("COUPLER", out _COUPLER, x => _coupler_types.ContainsKey(x), "VIT");
+            GetParseInputValue("COUPLER", out _COUPLER, x => _coupler_types.ContainsKey(x), "GC");
             _alignmentType = _coupler_types[_COUPLER];
         }
         #endregion
@@ -324,24 +337,46 @@ namespace AutoSPANMeasLib
                     _VOA.SetWavelength(_CENTER_WL);
                     _VOA.SetRawAttenuation(_arATTN_SETTINGS.ElementAt(VOA.FIXED)); // First Attn setting for LIV
                 }
-                _OptSwitch.Connect("COMMON", "ToAlign");
+                // how does this not error out??
+                //_OptSwitch.Connect("COMMON", "ToAlign");
 
                 // Align
-                Configure_Switch_Matrix_For_Measurement();
+                //Configure_Switch_Matrix_For_Measurement();
+                _matrix.DisconnectAll();
+
+                _matrix.ConnectPins(SPA_CONSTANTS.SMU1, _arPins_SMU1); //PD1N
+                _matrix.ConnectPins(SPA_CONSTANTS.SMU2, _arPins_SMU2); //PD2N
+                _matrix.ConnectPins(SPA_CONSTANTS.SMU3, _arPins_SMU3); //VOA1P
+                _matrix.ConnectPins(SPA_CONSTANTS.SMU4, _arPins_SMU4); //VOA2P
+                _matrix.ConnectPins(SPA_CONSTANTS.SMU5, _arPins_SMU5); // LZRP
+                //_matrix.ConnectPins(SPA_CONSTANTS.SMU6, _arPins_SMU6); // for oo-test, there's no TIA so this errors
+                _matrix.ConnectPins(SPA_CONSTANTS.GND2, _arPins_GND2); // Force gnd
+                _matrix.ConnectPins(SPA_CONSTANTS.GNDU, _arPins_GNDU); // sens gnd
+                _matrix.executeCachedConnections();
+
+
+                // 6/26 ester. this fn Apply_DC_Stress() is used to biasing the laser. how tell if rev/forwad biasing? which
                 Apply_DC_Stress(_PD_BIAS, _PD_BIAS, _arAA_BIAS.ElementAt(1), _arAA_BIAS.ElementAt(2), _arAA_BIAS.ElementAt(0), 0);
                 CArrayData myCoordinates = new CArrayData();
+                
                 if (!_bSKIP_ALIGN)
                 {
                     System.DateTime startTime = DateTime.UtcNow;
                     _alignment.MoveCalXY((float) _MOTOR_X, (float) _MOTOR_Y, Motors.ThorLabsOutputMotor);
+                    
+
                     //_alignment.MoveToZ(6080f, Motors.ThorLabsZOutputMotor);
-                    pause(1000);
-                    bool lowPassOrFocus = false;
-                    if (_COUPLER == "EIT")
-                    {
-                        lowPassOrFocus = true;
+                    pause(1000); // 6/26. ester unit ms, so 1s wait
+                    bool lowPassOrFocus = true;
+
+                    /*if (_COUPLER == "EIT")   // 6/26 ester. Y only EIT need LPF? unsure if GC needs
+                    { 
+                        lowPassOrFocus = true; // no LPF by default
                     }
+                    */
                     _alignment.Align(_alignmentType, (float) _AA_THRESHOLD, ref myCoordinates, true, lowPassOrFocus, false);
+                    // Align is overloaded 
+                    //_alignment.Align(_alignmentType, thres, ref myCoordinates, true, lowPassOrFocus, bRaster1);
 
                     _params["OPT_ALIGN_TIME"] =  (DateTime.UtcNow - startTime).TotalSeconds;
                 }
@@ -360,20 +395,30 @@ namespace AutoSPANMeasLib
                     if (Double.IsInfinity(outputpower)){
                         outputpower = ErrorCodes.INITIAL_PARAMETER_VALUE; 
                     }
+
                     DataRow row = _Active_Align_Coordinates_DataTable.NewRow();
+
+                    // ester. have to link this data table w the header info of output xyz motors of thorlabs--not nanocube header pins
+                    
                     row["Motor_Input_X_um"] = 0;
                     row["Motor_Input_Y_um"] = 0; 
                     row["Motor_Input_Z_um"] = 0; 
                     row["Piezo_Input_X_um"] = 0; 
                     row["Piezo_Input_Y_um"] = 0; 
                     row["Piezo_Input_Z_um"] = 0;
+                    
                     row["Motor_Output_X_um"] = (double)(myCoordinates.colArray[myCoordinates.arHeader.IndexOf("motor_X_out")].ToList()[0]) * 1000.0;
                     row["Motor_Output_Y_um"] = (double)(myCoordinates.colArray[myCoordinates.arHeader.IndexOf("motor_Y_out")].ToList()[0]) * 1000.0;
                     row["Motor_Output_Z_um"] = (double)(myCoordinates.colArray[myCoordinates.arHeader.IndexOf("motor_Z_out")].ToList()[0]) * 1000.0;
+                    
                     row["Piezo_Output_X_um"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("nano_X_out")].ToList()[0];
-                    row["Piezo_Output_Y_um"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("nano_Y_out")].ToList()[0];
+                    row["Piezo_Output_Y_um"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("MOTOR_X")].ToList()[0];
                     row["Piezo_Output_Z_um"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("nano_Z_out")].ToList()[0];
+                    
+                    
+
                     if (myCoordinates.arHeader.Contains("Align_Time"))
+                    
                     {
                         row["Activealigntime_seconds"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("Align_Time")].ToList()[0];
                     }
@@ -381,7 +426,7 @@ namespace AutoSPANMeasLib
                     {
                         row["Activealigntime_seconds"] = myCoordinates.colArray[myCoordinates.arHeader.IndexOf("Total_Align_Time")].ToList()[0];
                     }
-                    row["PowerLevel"] = outputpower;
+                    row["PowerLevel"] = outputpower; // this shouldnt be -9999.99, if so no power
                     _Active_Align_Coordinates_DataTable.Rows.Add(row);
                     log(string.Format("APT Optical Power after Alignment = {0}", outputpower));
                     is_aligned = outputpower >= (_AA_THRESHOLD - 10.0);
@@ -403,6 +448,7 @@ namespace AutoSPANMeasLib
                 GraphEvent(new GraphEventArgsAddFigure(getDeviceInfoString()));
 
                 // VOA Sweeps
+                // ester
                 if (_arVOA1_START.Count != 0 && _arVOA1_STOP.Count != 0 && _arVOA1_STEP.Count != 0)
                 {
                     Measure_LIV_LZR_VOA1_VOA2(_VOA1_DataTable, _arVOA1_START, _arVOA1_STOP, _arVOA1_STEP, is_aligned);
@@ -421,7 +467,7 @@ namespace AutoSPANMeasLib
                         saveArrayData("VOA_2", VOA2_DATA);
                     }
                 }
-
+                
                 // LIV sweeps
                 Measure_LIV_LZR_VOA1_VOA2(_LZR_DataTable, _arLIV_START, _arLIV_STOP, _arLIV_STEP, is_aligned);
                 {
@@ -453,11 +499,14 @@ namespace AutoSPANMeasLib
                 //List<double> delta = VecMath.absdiff(pout.ToArray()).ToList();
                 //GraphEvent(new GraphEventArgsPlot("", ilzr, delta, WpfGraphService.Styles.MatlabStyle("go-")));
 
+                //ester 7/8, commented this out
+                /*
                 if (!Is_The_Device_Working(_LIV_MIN_PWR_LIMIT))
                 {
                     this.addWaferTParam(_params);
                     return true;
                 }
+                */
                 
                 if (_bFBT_MODE_OSA || _bFBT_MODE_ESA)
                 {
@@ -658,7 +707,7 @@ namespace AutoSPANMeasLib
                 _VOA = (IAttenuator)StationHardware.Instance().MapInst[WaferLevelTestLib.Constants.ATTEN];
             }
             _OSA = (IOSA)StationHardware.Instance().MapInst[WaferLevelTestLib.Constants.OSA];
-            _ESA = (IESA)StationHardware.Instance().MapInst[WaferLevelTestLib.Constants.ESA];
+            //_ESA = (IESA)StationHardware.Instance().MapInst[WaferLevelTestLib.Constants.ESA];
         }
 
         public override bool posttest()
@@ -1494,7 +1543,7 @@ namespace AutoSPANMeasLib
                 _VOA.SetWavelength(_CENTER_WL);
                 _VOA.SetRawAttenuation(_arATTN_SETTINGS.ElementAt(VOA.FIXED));
             }
-            _OptSwitch.Connect("COMMON", "ToPWM");
+            //_OptSwitch.Connect("COMMON", "ToPWM");
 
             // Inline Apply_DC_Stress
             Apply_DC_Stress(_PD_BIAS, _PD_BIAS, 0, 0, 0, 0);
@@ -1636,7 +1685,7 @@ namespace AutoSPANMeasLib
             SMSR_Analysis _SMSR = new SMSR_Analysis();
             RIN_Analysis _RIN = new RIN_Analysis();
 
-            _OptSwitch.Connect("COMMON", "ToRIN");
+            //_OptSwitch.Connect("COMMON", "ToRIN");
             if (_VOA != null)
             {
                 _VOA.SetWavelength(_CENTER_WL);
@@ -1668,15 +1717,18 @@ namespace AutoSPANMeasLib
             for(int i=0; i<voa2_biases.Count; i++)
             {
                 double bias = voa2_biases.ElementAt(i);
-                VOASweepLimits.CheckAgainstLimits(ref bias); 
-                voa2_biases[i] = bias;
+                VOASweepLimits.CheckAgainstLimits(ref bias);
+                //ester 7/8, voa2_biases is len 2, not 1
+                //voa2_biases[i] = bias;
             }
 
             //% Apply DC stress
             Apply_DC_Stress(_PD_BIAS, _PD_BIAS, 0, 0, 0, 0);
 
             //Perform_Dark_Measurement (inlined)
-            double vtia_0 = Measure_Vtia(10, 0, 0);
+            // ester 7/8, commented out
+            //double vtia_0 = Measure_Vtia(10, 0, 0);
+            
             // % Configure_ESA_For_Reading
             Dictionary<string, string> ESA_settings = new Dictionary<string, string> (); 
             ESA_settings["fa"] = "50e3";
@@ -1722,8 +1774,10 @@ namespace AutoSPANMeasLib
             Configure_OSA_For_Reading();
 
             _alignment.SetTrack(_alignmentType, true);
-            double vtia_beginning = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 1);
-            vtia_beginning = vtia_beginning < 0 ? 0 : vtia_beginning;
+            
+            //ester 7/8
+            //double vtia_beginning = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 1);
+          //  vtia_beginning = vtia_beginning < 0 ? 0 : vtia_beginning;
 
             _alignment.SetTrack(_alignmentType, false);
 
@@ -1772,7 +1826,8 @@ namespace AutoSPANMeasLib
                         // read_spa_stress
                         Dictionary<string, double> dc_values;
                         Read_Spa_Stress(lzr_bias, voa1_bias, voa2_bias, out dc_values);  //40 ms
-                        double vtia = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 0);
+                        // ester 7/8
+                        //double vtia = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 0);
 
                         if (SWEEP_OSA) // 150ms
                         {
@@ -1825,6 +1880,8 @@ namespace AutoSPANMeasLib
                                 dr["Ivoa1_IN"] = dc_values["Ivoa1_IN"];
                                 dr["Ivoa2_IN"] = dc_values["Ivoa2_IN"];
                                 dr["wavelength_nm"] = OSA_DATA.wavelength.ElementAt(i);
+
+                                //here
                                 dr["Pout_dBm"] = OSA_DATA.power.ElementAt(i);
                                 dr["smsr_dB"] = SMSR_PARAMS["MIN_SMSR_OVER_0P2"];
                                 dr["peak_nm"] = SMSR_PARAMS["CENTER_WL"];
@@ -1846,7 +1903,8 @@ namespace AutoSPANMeasLib
                             // % calculate_RIN
                             double intRIN;
                             DenseVector RIN;
-                            _RIN.calculate_RIN(ESA_DATA.power, ESA_REF, vtia, ESA_settings, out RIN, out intRIN);
+                            
+                            //_RIN.calculate_RIN(ESA_DATA.power, ESA_REF, vtia, ESA_settings, out RIN, out intRIN);
 
                             // Create the processed integrated RIN data table
                             DataRow dr = dt_rin.NewRow();
@@ -1854,8 +1912,9 @@ namespace AutoSPANMeasLib
                             {
                                 dr[line.Key] = line.Value;
                             }
-                            dr["vtia"] = vtia;
-                            dr["intRIN"] = intRIN;
+                            //ester
+                            //dr["vtia"] = vtia;
+                            //dr["intRIN"] = intRIN;
                             dt_rin.Rows.Add(dr);
                             
                             // Create the raw data data table
@@ -1866,9 +1925,13 @@ namespace AutoSPANMeasLib
                                 dr["Ilzr_IN"] = dc_values["Ilzr_IN"];
                                 dr["Ivoa1_IN"] = dc_values["Ivoa1_IN"];
                                 dr["Ivoa2_IN"] = dc_values["Ivoa2_IN"];
-                                dr["Vtia"] = vtia;
+
+                                //ester
+                                //dr["Vtia"] = vtia;
                                 dr["Frequency_Hz"] = ESA_DATA.frequency.ElementAt(i);
-                                dr["RIN_dBpHz"] = RIN.ElementAt(i);
+
+                                //ester
+                                //dr["RIN_dBpHz"] = RIN.ElementAt(i);
                                 dt_esa.Rows.Add(dr);
                             }
                         }
@@ -1896,8 +1959,10 @@ namespace AutoSPANMeasLib
                 _alignment.SetTrack(_alignmentType, true);
                 is_tracking = true;
             }
-            double vtia_end = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 1);
-            vtia_end = vtia_end < 0 ? 0 : vtia_end;
+
+            //ester 7/8
+            //double vtia_end = Measure_Vtia(_NUM_VTIA_REPEATS,  vtia_0, 1);
+            //vtia_end = vtia_end < 0 ? 0 : vtia_end;
 
             if (is_tracking)
             {
@@ -1914,11 +1979,16 @@ namespace AutoSPANMeasLib
 
             Dictionary<string, double> MISC_VARS = new Dictionary<string, double> ();
             MISC_VARS.Add("_ESA_REF_MED_DBM", ESA_REF.power.Median());
-            MISC_VARS.Add("_VTIA_PRE_SWEEP", vtia_beginning);
-            MISC_VARS.Add("_VTIA_POST_SWEEP", vtia_end);
+            
+            //ester 7/8
+            //MISC_VARS.Add("_VTIA_PRE_SWEEP", vtia_beginning);
+            
+            //MISC_VARS.Add("_VTIA_POST_SWEEP", vtia_end);
             double epsilon = Math.Pow(2, -52); // Matlab definition
-            MISC_VARS.Add("_VTIA_PERC_CHANGE", (vtia_beginning - vtia_end)/(vtia_beginning + epsilon)*100.0);
-            _OptSwitch.Connect("COMMON", "ToPWM");
+
+            //ester 7/8
+            //MISC_VARS.Add("_VTIA_PERC_CHANGE", (vtia_beginning - vtia_end)/(vtia_beginning + epsilon)*100.0);
+            //_OptSwitch.Connect("COMMON", "ToPWM");
             return MISC_VARS;
         }
 
@@ -1972,7 +2042,7 @@ namespace AutoSPANMeasLib
             _spa.ForceI(SPA_CONSTANTS.SMU3, limit_range, voa1_ibias, _VOA_COMP.ToString(), "0", true); 
             _spa.ForceI(SPA_CONSTANTS.SMU4, limit_range, voa2_ibias, _VOA_COMP.ToString(), "0", true);
             _spa.ForceI(SPA_CONSTANTS.SMU5, limit_range, lzr_ibias, _LZR_COMP.ToString(), "0", true);
-            _spa.ForceI(SPA_CONSTANTS.SMU7, limit_range, tia_ibias, "6", "0", true); // Lab buddy comp
+            //_spa.ForceI(SPA_CONSTANTS.SMU7, limit_range, tia_ibias, "6", "0", true); // Lab buddy comp
             _spa.SetTriggerIn(SPA_CONSTANTS.TRIGGER_OFF);
             _spa.SetTriggerOut(SPA_CONSTANTS.TRIGGER_OFF);
         }
